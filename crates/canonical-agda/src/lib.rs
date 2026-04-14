@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use snailquote::unescape;
 use std::{
     ffi::{c_char, CStr, CString},
     str::FromStr,
@@ -7,7 +8,7 @@ use std::{
 #[derive(Serialize, Deserialize, Debug)]
 struct HSpine {
     shead: String,
-    shargs: Vec<HTerm>,
+    sargs: Vec<HTerm>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -16,30 +17,22 @@ struct HTerm {
     targs: HSpine,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct HTyp {
+    bindings: Vec<(String, HTyp)>,
+    spine: HSpine,
+}
+
 #[no_mangle]
-pub extern "C" fn hello(ptr: *const c_char) -> *mut c_char {
+pub extern "C" fn canonical(ptr: *const c_char) -> *mut c_char {
     unsafe {
-        let s = CStr::from_ptr(ptr);
-        println!("1: {}", s.to_str().unwrap());
-        // let js: HTerm = serde_json::from_str(s.to_str().expect("Error 1\n")).expect("Error 2 \n");
-        let t = HTerm {
-            thead: Vec::from([String::from("x"), String::from("y")]),
-            targs: HSpine {
-                shead: String::from("x"),
-                shargs: Vec::new(),
-            },
-        };
-
-        let js = serde_json::to_string(&t).unwrap();
-        println!("2: {}", js.as_str());
-
-        let s2 = CString::from_str(js.as_str()).expect("Error 3\n");
-        s2.into_raw()
-        // let s: &'static CStr = CStr::from_ptr(s2.as_ptr());
-        // let js2: HTerm = serde_json::from_str(s.to_str().expect("Error 1\n")).expect("Error 2 \n");
-        // println!("{:?}", js2);
-        // // s.as_ptr()
-        // let t = CString::new("aaaa").unwrap();
-        // t.into_raw()
+        let cstr = CStr::from_ptr(ptr);
+        let rstr = unescape(cstr.to_str().unwrap()).unwrap();
+        let typ: HTyp =
+            serde_json::from_str(rstr.as_str()).expect("Failed to convert the JSON to a type.\n");
+        let json = serde_json::to_string(&typ).expect("Failed to convert type to a JSON format.\n");
+        let cstr2 =
+            CString::from_str(json.as_str()).expect("Failed to convert JSON to a C string.\n");
+        cstr2.into_raw()
     }
 }
