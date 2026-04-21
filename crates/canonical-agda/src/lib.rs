@@ -3,13 +3,12 @@ use canonical_core::core::*;
 use canonical_core::memory::S;
 use canonical_core::prover::*;
 use canonical_core::search::*;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use snailquote::unescape;
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -32,6 +31,7 @@ struct HTerm {
 #[derive(Serialize, Deserialize, Debug)]
 struct HType {
     bindings: Vec<(String, HType)>,
+    lets: Vec<(String, HType)>,
     spine: HSpine,
 }
 
@@ -131,26 +131,35 @@ fn main(
 // static INSTANCE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[no_mangle]
-pub extern "C" fn canonical(ptr: *const c_char) -> *mut c_char {
+pub extern "C" fn canonical(
+    typ: *const c_char,
+    name: *const c_char,
+    timeout: u64,
+    count: usize,
+) -> *mut c_char {
     unsafe {
-        let cstr = CStr::from_ptr(ptr);
+        // get the type transmitted by haskell
+        let cstr = CStr::from_ptr(typ);
         let rstr = unescape(cstr.to_str().unwrap()).unwrap();
         let typ: HType =
             serde_json::from_str(rstr.as_str()).expect("Failed to convert the JSON to a type.\n");
 
-        // let instance = INSTANCE.lock().unwrap();
+        // get the IRType
         let ir_type = to_ir_type(&typ);
 
+        // Magic
         let (tx, rx) = mpsc::channel();
 
         let arc: Arc<Mutex<Vec<IRTerm>>> = Arc::new(Mutex::new(Vec::new()));
         let arc_clone = arc.clone();
         let tb = S::new(ir_type.to_type(&ES::new()));
-        let problem_bind = S::new(Bind::new("Test".to_string()));
+        let problem_bind = S::new(Bind::new(
+            CStr::from_ptr(name).to_string_lossy().into_owned(),
+        ));
         let mut owned_linked = Vec::new();
         let prover = Prover::new(tb.downgrade(), problem_bind.downgrade(), &mut owned_linked);
-        let worker = thread::spawn(move || main(prover, tx, 1, arc_clone));
-        let _ = rx.recv_timeout(Duration::from_secs(1000));
+        let worker = thread::spawn(move || main(prover, tx, count, arc_clone));
+        let _ = rx.recv_timeout(Duration::from_secs(timeout));
         RUN.store(false, Ordering::Relaxed);
         let res: Vec<HTerm> = match worker.join() {
             Ok((_, _)) => {
@@ -169,6 +178,7 @@ pub extern "C" fn canonical(ptr: *const c_char) -> *mut c_char {
             }
         };
 
+        // send back results to Haskell
         let json =
             serde_json::to_string(&res[0]).expect("Failed to convert type to a JSON format.\n");
         let cstr2 =
