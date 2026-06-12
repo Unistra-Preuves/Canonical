@@ -4,6 +4,7 @@ use canonical_core::memory::S;
 use canonical_core::prover::*;
 use canonical_core::search::*;
 use serde::{Deserialize, Serialize};
+use serde_json::from_str;
 use snailquote::unescape;
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
@@ -15,6 +16,9 @@ use std::{
     ffi::{c_char, CStr, CString},
     str::FromStr,
 };
+
+use std::fs::OpenOptions;
+use std::io::Write;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct HSpine {
@@ -30,9 +34,9 @@ struct HTerm {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct HType {
-    bindings: Vec<(String, HType)>,
-    lets: Vec<(String, HType)>,
-    spine: HSpine,
+    bindings: Vec<(String, Option <HType>)>,
+    lets: Vec<(String, Option<HType>)>,
+    codom: HSpine,
 }
 
 fn to_ir_var(v: &String) -> IRVar {
@@ -79,17 +83,28 @@ fn to_ir_type(ty: &HType) -> IRType {
         params: ty
             .bindings
             .iter()
-            .map(|(_, t)| Some(to_ir_type(t.to_owned())))
+            .map(|(_, t)| match t { None => None,  Some(ty) => Some(to_ir_type(ty.to_owned())),})
             .collect(),
-        lets: Vec::new(),
+        lets: ty
+            .lets
+            .iter()
+            .map(|(_, t)| match t { None => None,  Some(ty) => Some(to_ir_type(ty.to_owned())),})
+            .collect(),
         codomain: IRTerm {
             params: ty
                 .bindings
                 .iter()
                 .map(|(s, _)| IRVar { name: s.to_owned() })
                 .collect(),
-            lets: Vec::new(),
-            spine: to_ir_spine(&ty.spine),
+            lets: ty
+                .lets
+                .iter()
+                .map(|(s, _)| IRLet {
+                    var: IRVar { name: s.to_owned() },
+                    rules: Vec::new() }
+                )
+                .collect(),
+            spine: to_ir_spine(&ty.codom),
             goal_rules: Vec::new(),
         },
     }
@@ -128,7 +143,6 @@ fn main(
     )
 }
 
-// static INSTANCE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[no_mangle]
 pub extern "C" fn canonical(
@@ -138,11 +152,11 @@ pub extern "C" fn canonical(
     count: usize,
 ) -> *mut c_char {
     unsafe {
-        // get the type transmitted by haskell
-        let cstr = CStr::from_ptr(typ);
-        let rstr = unescape(cstr.to_str().unwrap()).unwrap();
+        // // get the type transmitted by haskell
+        let cstr = CStr::from_ptr(typ).to_str().unwrap();
+        // let rstr = unescape(cstr.to_str().unwrap()).unwrap();
         let typ: HType =
-            serde_json::from_str(rstr.as_str()).expect("Failed to convert the JSON to a type.\n");
+            serde_json::from_str(cstr).expect("Failed to convert the JSON to a type.\n");
 
         // get the IRType
         let ir_type = to_ir_type(&typ);
@@ -178,11 +192,24 @@ pub extern "C" fn canonical(
             }
         };
 
+
         // send back results to Haskell
         let json =
             serde_json::to_string(&res[0]).expect("Failed to convert type to a JSON format.\n");
         let cstr2 =
-            CString::from_str(json.as_str()).expect("Failed to convert JSON to a C string.\n");
+            CString::from_str(&json.as_str()).expect("Failed to convert JSON to a C string.\n");
+        //
+        // let st = CStr::from_ptr(typ).to_string_lossy().to_string();
+        // let mut fichier = OpenOptions::new()
+        //                 .append(true)
+        //                 .create(true)
+        //                 .open("/home/ewen/Stage/M2/temp/debug.txt")
+        //                 .expect("Impossible d'ouvrir");
+        // //
+        // writeln!(fichier, "{cstr}").unwrap();
+        // //
+        // let cstr2 =
+        //      CString::from_str(cstr).expect("Failed to convert JSON to a C string.\n");
         cstr2.into_raw()
     }
 }
