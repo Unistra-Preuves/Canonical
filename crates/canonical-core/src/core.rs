@@ -54,11 +54,10 @@ pub struct Assignment {
     pub args: Vec<S<Meta>>,
 
     /// `bind` (redundantly) contains the `Bind` of the `head` symbol in the context Gamma
-    pub bind: W<Bind>,
+    pub bind: W<Decl>,
 
     /// `changes` and `_owned_linked` allow us to return to the previous state during backtracking.
     pub changes: Vec<W<Meta>>,
-    pub redex_changes: Vec<W<Meta>>,
     pub _owned_linked: Vec<S<Linked>>, // never accessed, only used for ownership.
 
     /// True if the codomain of `head` is not stuck on a metavariable, for heuristics.
@@ -72,17 +71,16 @@ pub struct Meta {
     pub assignment: Option<Assignment>,
     /// The local variable context.
     pub gamma: ES,
-    /// Equations that are stuck on this metavariable.
-    pub equations: Vec<Equation>,
-    pub redex_constraints: Vec<RedexConstraint>,
+    /// Constraints that are stuck on this metavariable.
+    pub constraints: Vec<Box<dyn Constraint>>,
 
     /// The `Type` of this metavariable.
     pub typ: Option<Type>,
     /// The bindings introduced by this term.
-    pub bindings: W<Indexed<S<Bind>>>,
+    pub bindings: W<Indexed>,
     pub from_original_problem: bool,
 
-    pub _owned_bindings: Option<S<Indexed<S<Bind>>>>, // exclusively for ownership purposes.
+    pub _owned_bindings: Option<S<Indexed>>, // exclusively for ownership purposes.
 
     /// Statistics and heuristics information.
     /// Statistics are generally accumulated in `stats_buffer`, but this must be reset during parallel processing,
@@ -100,9 +98,8 @@ impl Meta {
         Meta {
             assignment: None,
             gamma: typ.1.clone(),
-            equations: Vec::new(),
-            redex_constraints: Vec::new(),
-            bindings: typ.0.borrow().codomain.borrow().bindings.clone(),
+            constraints: Vec::new(),
+            bindings: typ.0.borrow().typ.as_ref().unwrap().borrow().bindings.clone(),
             from_original_problem: false,
             _owned_bindings: None,
             stats: SearchInfo::new(),
@@ -114,59 +111,57 @@ impl Meta {
         }
     }
 
-    /// Checks that the assignment made to `self` does not violate an equation.
-    /// If successful, outputs the new equations and updates the `changes` of the assignment.
-    pub fn test_assignment(&mut self, this: W<Meta>) -> Option<(Vec<Equation>, Vec<RedexConstraint>)> {
-        let mut eqns = Vec::new();
+    /// Checks that the assignment made to `self` does not violate a constraint.
+    /// If successful, outputs the new constraints and updates the `changes` of the assignment.
+    pub fn test_assignment(&mut self, this: W<Meta>) -> Option<Vec<Box<dyn Constraint>>> {
+        let mut new_constraints: Vec<Box<dyn Constraint>> = Vec::new();
         let assn = self.assignment.as_mut().unwrap();
 
         // check the type of `self` with the codomain of the `var_type
-        if (!Equation { premise: assn.var_type.as_ref().unwrap().codomain(), goal: self.typ.as_ref().unwrap().codomain() }
-            .reduce(&mut eqns, &mut assn.changes, &mut assn._owned_linked)) { return None; }
-
-        let mut redex_constraints = Vec::new();
+        if (!Equation { premise: assn.var_type.as_ref().unwrap().codomain(), goal: self.typ.as_ref().unwrap().codomain(), allow_redexes: false }
+            .reduce(&mut new_constraints, &mut assn.changes, &mut assn._owned_linked)) { return None; }
 
         if !assn.bind.borrow().redexes.iter().all(|redex|
             RedexConstraint {
                 instructions: WVec::new(redex),
-                position: 0
-            }.reduce(&mut redex_constraints, &mut assn.redex_changes, this.clone())
+                position: 0,
+                blame: this.clone(),
+            }.reduce(&mut new_constraints, &mut assn.changes, &mut assn._owned_linked)
         ) { return None; }
 
-        if !self.redex_constraints.iter().all(|redex| 
-            redex.reduce(&mut redex_constraints, &mut assn.redex_changes, this.clone())
+        if !self.constraints.iter().all(|c|
+            c.reduce(&mut new_constraints, &mut assn.changes, &mut assn._owned_linked)
         ) { return None }
 
-        if !self.equations.iter().all(|eq|
-            eq.reduce(&mut eqns, &mut assn.changes, &mut assn._owned_linked)
-        ) { return None }
-
-        return Some((eqns, redex_constraints));
+        return Some(new_constraints);
     }
 
     /// Perform an (already tested) assignment.
-    pub fn assign(&mut self, mut assn: Assignment, eqns: Vec<Equation>, redex_constraints: Vec<RedexConstraint>) {
-        // store equations with their stuck metavaraible
-        for (item, slot) in eqns.into_iter().zip(assn.changes.iter_mut()) {
-            slot.borrow_mut().equations.push(item)
-        }
-        for (item, slot) in redex_constraints.into_iter().zip(assn.redex_changes.iter_mut()) {
-            slot.borrow_mut().redex_constraints.push(item)
+    pub fn assign(&mut self, mut assn: Assignment, constraints: Vec<Box<dyn Constraint>>) {
+        // store constraints with their stuck metavariable
+        for (item, slot) in constraints.into_iter().zip(assn.changes.iter_mut()) {
+            slot.borrow_mut().constraints.push(item)
         }
         self.assignment = Some(assn);
     }
 
-    /// Unassign the metavariable, returning equations to their pre-assignment state.
+    /// Unassign the metavariable, returning constraints to their pre-assignment state.
     pub fn unassign(&mut self) {
         let assn = self.assignment.as_mut().unwrap();
         for meta in assn.changes.iter_mut() {
-            meta.borrow_mut().equations.pop();
-        }
-        for meta in assn.redex_changes.iter_mut() {
-            meta.borrow_mut().redex_constraints.pop();
+            meta.borrow_mut().constraints.pop();
         }
         self.assignment = None;
     }
+}
+
+pub trait Constraint: std::any::Any {
+    /// Propagate the constraint on the basis of new assignments.
+    fn reduce(&self, constraints: &mut Vec<Box<dyn Constraint>>, changes: &mut Vec<W<Meta>>,
+              owned_linked: &mut Vec<S<Linked>>) -> bool;
+
+    /// Whether this constraint enforces an assignment on the stuck metavariable.
+    fn rigid(&self) -> bool { false }
 }
 
 /// A definitional (judgmental) equality between two `Term`s.
@@ -175,25 +170,31 @@ pub struct Equation {
     /// `premise` is a subterm of the `codomain` of the `Type` of a variable
     pub premise: Term,
     /// `goal` is a subterm of the `codomain` of the `Type` of a metavariable
-    pub goal: Term
+    pub goal: Term,
+    pub allow_redexes: bool
 }
 
 #[derive(Clone)]
 pub struct RedexConstraint {
     pub instructions: WVec<Instruction>,
-    pub position: usize
+    pub position: usize,
+    /// The metavariable this constraint is currently walking from.
+    pub blame: W<Meta>
 }
 
-impl RedexConstraint {
-    fn reduce(&self, redex_constraints: &mut Vec<RedexConstraint>, redex_changes: &mut Vec<W<Meta>>, mut blame: W<Meta>) -> bool {
+impl Constraint for RedexConstraint {
+    fn reduce(&self, constraints: &mut Vec<Box<dyn Constraint>>, changes: &mut Vec<W<Meta>>,
+              _owned_linked: &mut Vec<S<Linked>>) -> bool {
+        let mut blame = self.blame.clone();
         let mut i = self.position;
         loop {
             let Some(assn) = &blame.borrow().assignment else {
-                redex_constraints.push(RedexConstraint {
+                constraints.push(Box::new(RedexConstraint {
                     instructions: self.instructions.clone(),
-                    position: i
-                });
-                redex_changes.push(blame);
+                    position: i,
+                    blame: blame.clone(),
+                }));
+                changes.push(blame);
                 return true
             };
 
@@ -213,16 +214,16 @@ impl RedexConstraint {
 }
 
 
-impl Equation {
-    /// Break down the equation into equations that are stuck on metavariables, added to `equations`.
+impl Constraint for Equation {
+    /// Break down the equation into equations that are stuck on metavariables, added to `constraints`.
     /// Returns false if the equation is violated.
-    pub fn reduce(&self, equations: &mut Vec<Equation>, changes: &mut Vec<W<Meta>>,
+    fn reduce(&self, constraints: &mut Vec<Box<dyn Constraint>>, changes: &mut Vec<W<Meta>>,
               owned_linked: &mut Vec<S<Linked>>) -> bool {
         if owned_linked.len() > 1000 { return false }
         // Reduce both sides of the equation.
-        match self.premise.whnf::<true, ()>(owned_linked, &mut ()) {
+        match self.premise.whnf::<true, ()>(owned_linked, &mut (), self.allow_redexes) {
             WHNF(premise, Head::Var(lhs)) => {
-                match self.goal.whnf::<true, ()>(owned_linked, &mut ()) {
+                match self.goal.whnf::<true, ()>(owned_linked, &mut (), self.allow_redexes) {
                     WHNF(goal, Head::Var(rhs)) => {
                         // If the head symbols are not equal, the equation is violated.
                         if !lhs.eq(&rhs) { return false }
@@ -234,13 +235,14 @@ impl Equation {
                         (0..premise.base.borrow().assignment.as_ref().unwrap().args.len()).all(|i|
                             Equation {
                                 premise: premise.arg(i, Entry::vars(var_id), owned_linked),
-                                goal: goal.arg(i, Entry::vars(var_id), owned_linked)
-                            }.reduce(equations, changes, owned_linked)
+                                goal: goal.arg(i, Entry::vars(var_id), owned_linked),
+                                allow_redexes: self.allow_redexes
+                            }.reduce(constraints, changes, owned_linked)
                         )
                     }
                     WHNF(goal, Head::Meta(rhs)) => {
                         // goal is stuck, add an equation associated with goal_meta.
-                        equations.push(Equation { premise, goal });
+                        constraints.push(Box::new(Equation { premise, goal, allow_redexes: self.allow_redexes }));
                         changes.push(rhs);
                         true
                     }
@@ -248,11 +250,16 @@ impl Equation {
             }
             WHNF(premise, Head::Meta(lhs)) => {
                 // premise is stuck, add an equation associated with premise_meta.
-                equations.push(Equation { premise, goal: self.goal.clone() });
+                constraints.push(Box::new(Equation { premise, goal: self.goal.clone(), allow_redexes: self.allow_redexes }));
                 changes.push(lhs);
-                true   
+                true
             }
         }
+    }
+
+    fn rigid(&self) -> bool {
+        matches!(self.premise.whnf::<true, ()>(&mut Vec::new(), &mut (), self.allow_redexes).1, Head::Var(_)) ||
+        matches!(self.goal.whnf::<true, ()>(&mut Vec::new(), &mut (), self.allow_redexes).1, Head::Var(_))
     }
 }
 
@@ -273,13 +280,13 @@ impl Subst {
 }
 
 /// A list indexed by `Index`.
-pub struct Indexed<T> {
-    pub params: Vec<T>,
-    pub lets: Vec<T>
+pub struct Indexed {
+    pub params: Vec<S<Decl>>,
+    pub lets: Vec<S<Decl>>
 }
 
-impl<T> std::ops::Index<Index> for Indexed<T> {
-    type Output = T;
+impl std::ops::Index<Index> for Indexed {
+    type Output = S<Decl>;
 
     fn index(&self, index: Index) -> &Self::Output {
         match index {
@@ -289,10 +296,10 @@ impl<T> std::ops::Index<Index> for Indexed<T> {
     }
 }
 
-impl<T> Indexed<T> {
+impl Indexed {
     /// We iterate over params first, as free variables are generally more important than consts.
     /// We iterate over params and lets in reverse order to prioritize dependently typed variables.
-    pub fn iter(indexed: &Indexed<T>) -> impl Iterator<Item = Index> + '_ {
+    pub fn iter(indexed: &Indexed) -> impl Iterator<Item = Index> + '_ {
         let params_iter = (0..indexed.params.len()).rev().map(Param);
         let lets_iter = (0..indexed.lets.len()).rev().map(Let);
         params_iter.chain(lets_iter)
@@ -300,15 +307,15 @@ impl<T> Indexed<T> {
 }
 
 pub struct Instruction {
-    pub bind: W<Bind>,
+    pub bind: W<Decl>,
     pub parents: u32,
     pub child: usize
 }
 
 pub struct Symbol {
-    pub bind: W<Bind>,
+    pub bind: W<Decl>,
     pub children: Vec<usize>,
-    pub bindings: S<Indexed<S<Bind>>>
+    pub bindings: S<Indexed>
 }
 
 pub struct Rule {
@@ -318,21 +325,33 @@ pub struct Rule {
 }
 
 /// The `name` and `value` of a variable in the original input problem.
-pub struct Bind {
+// pub struct Bind {
+//     pub name: String,
+//     pub constraints: Vec<(S<Meta>, S<Meta>)>,
+//     pub rules: Vec<Rule>,
+//     pub redexes: Vec<Vec<Instruction>>,
+
+//     pub owned_bindings: Vec<S<Indexed<S<Bind>>>>
+// }
+
+pub struct Decl {
     pub name: String,
+    pub constraints: Vec<(S<Meta>, S<Meta>, bool)>,
     pub rules: Vec<Rule>,
     pub redexes: Vec<Vec<Instruction>>,
-
-    pub owned_bindings: Vec<S<Indexed<S<Bind>>>>
+    pub typ: Option<S<Meta>>,
+    pub _owned_bindings: Vec<S<Indexed>>
 }
 
-impl Bind {
+impl Decl {
     pub fn new(name: String) -> Self {
-        Bind {
+        Decl {
             name,
+            constraints: Vec::new(),
             rules: Vec::new(),
             redexes: Vec::new(),
-            owned_bindings: Vec::new()
+            typ: None,
+            _owned_bindings: Vec::new()
         }
     }
 }
@@ -349,10 +368,10 @@ pub struct Entry {
 
 impl Entry {
     /// Creates a substitution entry.
-    pub fn subst(subst: Subst) -> Self {
+    pub fn subst(subst: Subst, lets_id: u64) -> Self {
         Self {
             params_id: next_u64(),
-            lets_id: next_u64(),
+            lets_id,
             subst: Some(subst),
             context: None
         }
@@ -372,7 +391,7 @@ impl Entry {
 /// An `entry` accompanied with the associated `bindings` from the original problem. 
 pub struct Node {
     pub entry: Entry,
-    pub bindings: W<Indexed<S<Bind>>>,
+    pub bindings: W<Indexed>,
 }
 
 /// A linked list of `Node`
@@ -415,7 +434,7 @@ impl ES {
         }
         ES { linked: Some(curr.to_owned()) }
     }
-    
+
     /// Gets the variable at the root of this ES at the given `index`
     pub fn get_var(&self, index: Index) -> Var {
         let node = &self.linked.as_ref().unwrap().borrow().node;
@@ -442,7 +461,7 @@ impl ES {
     }
 
     /// Finds the `DeBruijnIndex` and `Bind` with a certain `name` in this `ES`.
-    pub fn index_of(&self, name: &String) -> Option<(DeBruijnIndex, W<Bind>)> {
+    pub fn index_of(&self, name: &String) -> Option<(DeBruijnIndex, W<Decl>)> {
         self.iter().find(|(db, linked)| &linked.borrow().node.bindings.borrow()[db.1].borrow().name == name)
             .map(|(db, linked)| (db, linked.borrow().node.bindings.borrow()[db.1].downgrade()))
     }
@@ -492,8 +511,8 @@ impl Term {
         Term { es: self.es.append(Node { entry, bindings: base.borrow().bindings.clone() }, owned_linked), base }
     }
 
-    /// Computes the weak head normal form. 
-    pub fn whnf<const RULES: bool, C: Attribution>(&self, owned_linked: &mut Vec<S<Linked>>, attribution: &mut C) -> WHNF {
+    /// Computes the weak head normal form.
+    pub fn whnf<const RULES: bool, C: Attribution>(&self, owned_linked: &mut Vec<S<Linked>>, attribution: &mut C, allow_redexes: bool) -> WHNF {
         guard_overflow();
         if let Some(assn) = &self.base.borrow().assignment {
             let es = self.es.sub_es(assn.head.0);
@@ -501,9 +520,9 @@ impl Term {
             // If there is a term at the head, recursively reduce it. Otherwise, the variable is the head symbol.
             if let Param(i) = assn.head.1 {
                 if let Some(subst) = &es.linked.as_ref().unwrap().borrow().node.entry.subst {
-                    // If there is a substitution, and the index is a parameter, return the associated term in the substitution. 
-                    let term = subst.get(i, Entry::subst(Subst(WVec::new(&assn.args), self.es.clone())), owned_linked);
-                    return term.whnf::<RULES, C>(owned_linked, attribution);
+                    let lets_id = subst.0[i].borrow().gamma.linked.as_ref().map_or_else(next_u64, |linked| linked.borrow().node.entry.lets_id);
+                    let term = subst.get(i, Entry::subst(Subst(WVec::new(&assn.args), self.es.clone()), lets_id), owned_linked);
+                    return term.whnf::<RULES, C>(owned_linked, attribution, allow_redexes);
                 }
             }
 
@@ -517,10 +536,10 @@ impl Term {
                     rule: &rule
                 }).collect();
                 let mut stuck : Option<W<Meta>> = None;
-                let matched = whnf.pattern_match(&mut matchers, owned_linked, attribution, whnf.0.base.borrow().from_original_problem, &mut stuck);
+                let matched = whnf.pattern_match(&mut matchers, owned_linked, attribution, allow_redexes || whnf.0.base.borrow().from_original_problem, &mut stuck);
                 if let ControlFlow::Break((term, rule)) = matched {
                     attribution.attribute(rule);
-                    return term.whnf::<RULES, C>(owned_linked, attribution);
+                    return term.whnf::<RULES, C>(owned_linked, attribution, allow_redexes);
                 }
                 if let Some(meta) = stuck {
                     return WHNF(self.clone(), Head::Meta(meta));
@@ -556,7 +575,7 @@ impl <'a> WHNF {
                         if symbol.bind.eq(&var.bind) {
                             ordering = Some(&symbol.children);
                             matcher.replacement.es = matcher.replacement.es.append(Node {
-                                entry: Entry::subst(Subst(WVec::new(&self.0.base.borrow().assignment.as_ref().unwrap().args), self.0.es.clone())),
+                                entry: Entry::subst(Subst(WVec::new(&self.0.base.borrow().assignment.as_ref().unwrap().args), self.0.es.clone()), next_u64()),
                                 bindings: symbol.bindings.downgrade()
                             }, owned_linked);
                             if matcher.pattern.len() == 0 {
@@ -570,7 +589,7 @@ impl <'a> WHNF {
                 if let Some(ordering) = ordering {
                     for &i in ordering {
                         let arg = self.0.arg(i, Entry::vars(next_u64()), owned_linked);
-                        arg.whnf::<true, C>(owned_linked, attribution).pattern_match(&mut recursive, owned_linked, attribution, can_stuck, stuck)?;
+                        arg.whnf::<true, C>(owned_linked, attribution, can_stuck).pattern_match(&mut recursive, owned_linked, attribution, can_stuck, stuck)?;
                         if recursive.is_empty() { break; }
                     }
                 }
@@ -588,24 +607,24 @@ pub enum Polarity {
 
 /// A `DeBruijnIndex`-ed type, with a `codomain` (return type)
 /// and parameter/let `types` 
-pub struct TypeBase {
-    pub codomain: S<Meta>,
-    pub types: S<Indexed<Option<S<TypeBase>>>>,
-}
+// pub struct TypeBase {
+//     pub codomain: S<Meta>,
+//     pub types: S<Indexed<Option<S<TypeBase>>>>,
+//     pub bind: W<Bind>
+// }
 
-impl TypeBase {
+impl Meta {
     /// Create new metavariables to fill the parameters of this TypeBase.
     pub fn args_metas(&self, parent: Option<W<Meta>>) -> Vec<S<Meta>> {
-        let arity = self.types.borrow().params.len();
+        let arity = self.bindings.borrow().params.len();
         let mut args = Vec::with_capacity(arity);
         for i in 0..arity {
             args.push(S::new(Meta {
                 assignment: None,
                 typ: None,
                 gamma: ES::new(),
-                equations: Vec::new(),
-                redex_constraints: Vec::new(),
-                bindings: self.types.borrow()[Index::Param(i)].as_ref().unwrap().borrow().codomain.borrow().bindings.clone(),
+                constraints: Vec::new(),
+                bindings: self.bindings.borrow()[Index::Param(i)].borrow().typ.as_ref().unwrap().borrow().bindings.clone(),
                 from_original_problem: false,
                 _owned_bindings: None,
                 stats: SearchInfo::new(),
@@ -623,21 +642,20 @@ impl TypeBase {
 /// that associates a `DeBruijnIndex` with a variable or term.
 /// The `Bind` corresponds to the variable in the original problem that has this `Type`. 
 #[derive(Clone)]
-pub struct Type(pub W<TypeBase>, pub ES, pub W<Bind>);
+pub struct Type(pub W<Decl>, pub ES);
 
 impl Type {
     /// Get the return type, as a `Term`.
     pub fn codomain(&self) -> Term {
-        Term { base: self.0.borrow().codomain.downgrade(), es: self.1.clone() }
+        Term { base: self.0.borrow().typ.as_ref().unwrap().downgrade(), es: self.1.clone() }
     }
 
     /// Get the `i`th parameter type, specialized to `entry`.
     pub fn get(&self, i: Index, entry: Entry, owned_linked: &mut Vec<S<Linked>>) -> Type {
-        let base = self.0.borrow().types.borrow()[i].as_ref().unwrap();
+        let base = &self.0.borrow().typ.as_ref().unwrap().borrow().bindings.borrow()[i];
         Type(
             base.downgrade(), 
-            self.1.append(Node {entry, bindings: base.borrow().codomain.borrow().bindings.clone() }, owned_linked),
-            self.0.borrow().codomain.borrow().bindings.borrow()[i].downgrade()
+            self.1.append(Node {entry, bindings: base.borrow().typ.as_ref().unwrap().borrow().bindings.clone() }, owned_linked),
         )
     }
 }
@@ -647,7 +665,7 @@ impl Type {
 pub struct Var {
     entry_id: u64,
     index: Index,
-    pub bind: W<Bind>
+    pub bind: W<Decl>
 }
 
 impl Var {

@@ -2,7 +2,6 @@ use crate::search::*;
 use crate::core::*;
 use crate::memory::*;
 use crate::stats::*;
-use crate::compiler::compile;
 use rayon::prelude::*;
 use std::sync::atomic::{Ordering, AtomicUsize};
 use std::sync::Arc;
@@ -13,33 +12,88 @@ pub static NUM_JOBS: AtomicUsize = AtomicUsize::new(0);
 
 /// A `Prover` has a metavariable for the main goal, and a flag for `program_synthesis` mode.
 pub struct Prover {
-    pub meta: S<Meta>,
-    /// In case we only want to solve a subtree of `meta`, this defines the root for `next`.
-    pub next_root: W<Meta>
+    /// The root metavariable, in a `Vec` to serve as the substitution for the problem's name.
+    pub metas: Vec<S<Meta>>,
+    /// In case we only want to solve a subtree of the root, this defines the root for `next`.
+    pub next_root: W<Meta>,
+    /// Owns the nodes of the root metavariable's ES.
+    pub _owned_linked: Vec<S<Linked>>
 }
 
 unsafe impl Send for Prover {}
 unsafe impl Send for W<Meta> {}
 
 impl Prover {
-    /// Creates a new Prover for the specified `Type`. 
-    pub fn new(tb_ref: W<TypeBase>, problem_bind: W<Bind>, owned_linked: &mut Vec<S<Linked>>) -> Self {
-        let entry = &tb_ref.borrow().codomain.borrow().gamma.linked.as_ref().unwrap().borrow().node.entry;
-        let node = Node { 
-            entry: Entry { params_id: entry.params_id, lets_id: entry.lets_id, subst: None, 
-                context: Some(Type(tb_ref.clone(), tb_ref.borrow().codomain.borrow().gamma.clone(), problem_bind.clone()))}, 
-            bindings: tb_ref.borrow().codomain.borrow().gamma.linked.as_ref().unwrap().borrow().node.bindings.clone() 
-        };
-        let es = ES::new().append(node, owned_linked);
-        compile(Type(tb_ref.clone(), ES::new(), problem_bind.clone()));
-        let ty = Type(tb_ref.clone(), es, problem_bind.clone());
-        let meta = S::new(Meta::new(ty));
-        Prover { next_root: meta.downgrade(), meta }
+    /// Creates a `Prover` solving for `decl`, placing its type and equations on a new metavariable.
+    /// The type and equations are evaluated under an ES that recreates the declaration's gamma:
+    /// a substitution mapping the problem's name to the metavariable itself, and the variables of the type.
+    /// The metavariable's gamma contains only the variables of the type, with `decl` as the typing context.
+    pub fn new(decl: W<Decl>) -> Self {
+        let mut owned_linked = Vec::new();
+        let mut metas = vec![S::new(Meta::new(Type(decl.clone(), ES::new())))];
+
+        let translation = decl.borrow().typ.as_ref().unwrap().borrow().gamma.clone();
+        let vars = translation.linked.clone().unwrap();
+        let dummy = vars.borrow().tail.clone().unwrap();
+
+        // Recreate the dummy node, substituting the metavariable for the problem's name.
+        let es = ES::new().append(Node {
+            entry: Entry {
+                params_id: dummy.borrow().node.entry.params_id,
+                lets_id: dummy.borrow().node.entry.lets_id,
+                subst: Some(Subst(WVec::new(&metas), ES::new())),
+                context: None
+            },
+            bindings: dummy.borrow().node.bindings.clone()
+        }, &mut owned_linked);
+
+        // Recreate the node of the variables of the type.
+        let typ = Type(decl.clone(), es.append(Node {
+            entry: Entry {
+                params_id: vars.borrow().node.entry.params_id,
+                lets_id: vars.borrow().node.entry.lets_id,
+                subst: None,
+                context: None
+            },
+            bindings: vars.borrow().node.bindings.clone()
+        }, &mut owned_linked));
+
+        // The gamma contains only the variables of the type, with `decl` as the typing context.
+        let gamma = ES::new().append(Node {
+            entry: Entry {
+                params_id: vars.borrow().node.entry.params_id,
+                lets_id: vars.borrow().node.entry.lets_id,
+                subst: None,
+                context: Some(typ.clone())
+            },
+            bindings: vars.borrow().node.bindings.clone()
+        }, &mut owned_linked);
+
+        // Place the type and equations of the declaration on the metavariable.
+        metas[0].borrow_mut().gamma = gamma;
+        metas[0].borrow_mut().constraints = decl.borrow().constraints.iter().map(|(premise, goal, allow_redexes)| {
+            let constraint: Box<dyn Constraint> = Box::new(Equation {
+                premise: Term { base: premise.downgrade(), es: typ.1.clone() },
+                goal: Term { base: goal.downgrade(), es: typ.1.clone() },
+                allow_redexes: *allow_redexes
+            });
+            constraint
+        }).collect();
+        metas[0].borrow_mut().typ = Some(typ);
+
+        Prover { next_root: metas[0].downgrade(), metas, _owned_linked: owned_linked }
     }
 
-    /// Gets the current (partial) term of the prover. 
+    /// Clone the term rooted at `meta` into a fresh `Prover` for the same problem.
+    pub fn from_root(meta: W<Meta>) -> Option<Prover> {
+        let prover = Prover::new(meta.borrow().typ.as_ref().unwrap().0.clone());
+        let mut map = HashMap::default();
+        transfer(meta, prover.metas[0].downgrade(), &mut map).then_some(prover)
+    }
+
+    /// Gets the current (partial) term of the prover.
     pub fn get_term(&self) -> Term {
-        Term { base: self.meta.downgrade(), es: self.meta.borrow().gamma.clone() }
+        Term { base: self.metas[0].downgrade(), es: self.metas[0].borrow().gamma.clone() }
     }
 
     /// Start proof search, with a callback for solutions.
@@ -112,7 +166,7 @@ impl Prover {
                 attempts += 1;
             }
             if let Some(Some(result)) = attempt {
-                total_weight += result.3.weight();
+                total_weight += result.2.weight();
                 options.push(result);
             }
         }
@@ -124,10 +178,10 @@ impl Prover {
         let num_jobs = NUM_JOBS.load(Ordering::Relaxed);
 
         if branching < 2 || next_result.tree_entropy > 1000.0 || num_jobs > 100 {
-            while let Some((assignment, equations, redex_constraints, info)) = iter.next() {
+            while let Some((assignment, constraints, info)) = iter.next() {
                 let meta = next.meta.borrow_mut();
 
-                meta.assign(assignment, equations, redex_constraints);
+                meta.assign(assignment, constraints);
 
                 // Start assignment statistics.
                 meta.stats.assignment_fence();
@@ -157,8 +211,8 @@ impl Prover {
 
         // Create cloned provers for each remaining option. 
         let provers: Vec<(Prover, W<Meta>, AssignmentInfo)> = iter.filter_map(
-            |(assignment, equations, redex_constraints, info)| {
-            next.meta.borrow_mut().assign(assignment, equations, redex_constraints);
+            |(assignment, constraints, info)| {
+            next.meta.borrow_mut().assign(assignment, constraints);
 
             next.meta.borrow_mut().branching = total_weight / info.weight();
             let result = self.try_clone();
@@ -215,15 +269,18 @@ impl Prover {
     }
 
     /// Return a clone of this prover and a map of metavariables between this and the new clone, with `stats_buffer` moved into `stats`.
+    /// The clone is created with `Prover::new`, so it receives the equations of the declaration.
     pub fn try_clone(&self) -> Option<(Self, HashMap<W<Meta>, W<Meta>>)> {
-        Meta::try_clone(self.meta.downgrade()).map(|(meta, map)| {
-            (Prover { meta, next_root: map.get(&self.next_root).unwrap().clone() }, map)
-        })
+        let mut prover = Prover::new(self.metas[0].borrow().typ.as_ref().unwrap().0.clone());
+        let mut map = HashMap::default();
+        if !transfer(self.metas[0].downgrade(), prover.metas[0].downgrade(), &mut map) { return None }
+        prover.next_root = map.get(&self.next_root).unwrap().clone();
+        Some((prover, map))
     }
 
-    /// Accumulate the statistics of `other` into self. 
+    /// Accumulate the statistics of `other` into self.
     fn accumulate(&self, other: Prover) {
-        accumulate_stats(self.meta.downgrade(), other.meta.downgrade());
+        accumulate_stats(self.metas[0].downgrade(), other.metas[0].downgrade());
     }
 }
 
@@ -239,12 +296,12 @@ pub fn transfer(from: W<Meta>, mut to: W<Meta>, map: &mut HashMap<W<Meta>, W<Met
     let Some(from_assn) = &from.borrow().assignment else { return true; };
     
     let sub_es = to.borrow().gamma.sub_es(from_assn.head.0);
-    let Some(Some((to_assn, eqns, redex_constraints, _info))) = 
-        test(from_assn.head, sub_es.linked.unwrap(), to.clone()) else { 
-            return false; 
+    let Some(Some((to_assn, constraints, _info))) =
+        test(from_assn.head, sub_es.linked.unwrap(), to.clone()) else {
+            return false;
         };
-    
-    to.borrow_mut().assign(to_assn, eqns, redex_constraints);
+
+    to.borrow_mut().assign(to_assn, constraints);
 
     from_assn.args.iter().zip(to.borrow().assignment.as_ref().unwrap().args.iter()).all(
         |(from_child, to_child)|

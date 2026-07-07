@@ -63,8 +63,9 @@ pub struct AppState {
 
     // For ownership purposes.
     pub _owned_linked: Vec<S<Linked>>,
-    pub _owned_tb: S<TypeBase>,
-    pub _owned_bind: S<Bind>
+    pub _owned_bind: S<Decl>,
+    /// Provers whose nodes may be referenced by `current` and the undo/redo stacks.
+    pub _owned_provers: Vec<Prover>
 }
 
 /// Sent from JS to represent an assignment.
@@ -97,7 +98,7 @@ async fn term(State(state): State<Arc<Mutex<AppState>>>) -> Json<serde_json::Val
     };
     let meta = state.current.downgrade();
     let mut owned_linked = Vec::new();
-    let term = IRSpine::from_body::<false>(Term { base: meta.clone(), es: meta.borrow().gamma.clone() }.whnf::<false, ()>(&mut owned_linked, &mut ()), true);
+    let term = IRSpine::from_body::<false>(Term { base: meta.clone(), es: meta.borrow().gamma.clone() }.whnf::<false, ()>(&mut owned_linked, &mut (), false), true);
     let html = term.to_string();
     let next = Meta::next(meta)
         .next
@@ -141,13 +142,13 @@ async fn assign(
     let mut i = 0;
 
     while i < AUTOFILL_LIMIT {
-        let Some(Some((assn, eqns, redexes, _))) = test(
+        let Some(Some((assn, constraints, _))) = test(
             db,
             meta.borrow().gamma.sub_es(db.0).linked.unwrap(),
             meta.clone()
         ) else { break; };
 
-        meta.borrow_mut().assign(assn, eqns, redexes);
+        meta.borrow_mut().assign(assn, constraints);
 
         if !state.autofill {
             break;
@@ -213,9 +214,11 @@ async fn canonical(State(state): State<Arc<Mutex<AppState>>>) -> Json<serde_json
         return Json(json!({}))
     };
     let meta = Meta::try_clone(state.current.downgrade()).unwrap().0;
-    let prover = Prover { next_root: meta.downgrade(), meta };
+    let prover = Prover { next_root: meta.downgrade(), metas: vec![meta], _owned_linked: Vec::new() };
 
-    if let Some(term) = canonical_simple(prover) {
+    if let Some(solved) = canonical_simple(prover) {
+        let term = Meta::try_clone(solved.metas[0].downgrade()).unwrap().0;
+        state._owned_provers.push(solved);
         let prev = mem::replace(&mut state.current, term);
         state.redo.clear();
         state.undo.push(prev);
@@ -232,8 +235,10 @@ async fn canonical1(State(state): State<Arc<Mutex<AppState>>>, Json(solve1) : Js
     let (meta, map) = Meta::try_clone(current.clone()).unwrap();
     let next_root = map.get(&find_with_id(current, solve1.meta_id).unwrap()).unwrap().clone();
 
-    let prover = Prover { next_root, meta };
-    if let Some(term) = canonical_simple(prover) {
+    let prover = Prover { next_root, metas: vec![meta], _owned_linked: Vec::new() };
+    if let Some(solved) = canonical_simple(prover) {
+        let term = Meta::try_clone(solved.metas[0].downgrade()).unwrap().0;
+        state._owned_provers.push(solved);
         let prev = mem::replace(&mut state.current, term);
         state.redo.clear();
         state.undo.push(prev);
@@ -241,22 +246,22 @@ async fn canonical1(State(state): State<Arc<Mutex<AppState>>>, Json(solve1) : Js
     Json(json!({}))
 }
 
-/// Run Canonical for 1 second on `prover`, returning the term if one is found.
-fn canonical_simple(prover: Prover) -> Option<S<Meta>> {
+/// Run Canonical for 1 second on `prover`, returning a self-contained prover with the solution if one is found.
+fn canonical_simple(prover: Prover) -> Option<Prover> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
         prover.prove(&|value| {
-            if let Some(cloned) = Meta::try_clone(value.base) {
-                let _ = tx.send(Some(cloned.0));
-            } 
+            if let Some(solved) = Prover::from_root(value.base.clone()) {
+                let _ = tx.send(Some(solved));
+            }
         }, false);
         tx.send(None)
     });
 
-    let term = rx.recv_timeout(Duration::from_secs(1));
+    let solved = rx.recv_timeout(Duration::from_secs(1));
     RUN.store(false, Ordering::Relaxed);
-    term.ok().flatten()
+    solved.ok().flatten()
 }
 
 /// Find a metavariable with the given hashcode in the children of `meta`.
