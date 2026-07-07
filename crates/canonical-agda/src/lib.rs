@@ -33,9 +33,15 @@ struct HTerm {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct HRule {
+    rlhs : HSpine,
+    rrhs : HSpine
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct HType {
     bindings: Vec<(String, Option <HType>)>,
-    lets: Vec<(String, Option<HType>)>,
+    lets: Vec<(String, Option<HType>, Vec<HRule>)>,
     codom: HSpine,
 }
 
@@ -78,6 +84,15 @@ fn to_hspine(sp: &IRSpine) -> HSpine {
     }
 }
 
+fn to_ir_rule(rl : &HRule) -> IRRule {
+    IRRule{
+        lhs: to_ir_spine(&rl.rlhs),
+        rhs: to_ir_spine(&rl.rrhs),
+        attribution : Vec::new(),
+        is_redex : false
+    }
+}
+
 fn to_ir_type(ty: &HType) -> IRType {
     IRType {
         params: ty
@@ -88,7 +103,7 @@ fn to_ir_type(ty: &HType) -> IRType {
         lets: ty
             .lets
             .iter()
-            .map(|(_, t)| match t { None => None,  Some(ty) => Some(to_ir_type(ty.to_owned())),})
+            .map(|(_, t, _ )| match t { None => None,  Some(ty) => Some(to_ir_type(ty.to_owned())),})
             .collect(),
         codomain: IRTerm {
             params: ty
@@ -99,9 +114,9 @@ fn to_ir_type(ty: &HType) -> IRType {
             lets: ty
                 .lets
                 .iter()
-                .map(|(s, _)| IRLet {
+                .map(|(s, _, rs)| IRLet {
                     var: IRVar { name: s.to_owned() },
-                    rules: Vec::new() }
+                    rules: rs.iter().map(|r| to_ir_rule(r)).collect() }
                 )
                 .collect(),
             spine: to_ir_spine(&ty.codom),
