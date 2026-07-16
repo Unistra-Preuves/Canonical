@@ -3,7 +3,6 @@ use canonical_core::core::*;
 use canonical_core::prover::*;
 use canonical_core::search::*;
 use serde::{Deserialize, Serialize};
-use serde_json::from_str;
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
@@ -14,6 +13,7 @@ use std::{
     ffi::{c_char, CStr, CString},
     str::FromStr,
 };
+
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -27,7 +27,8 @@ struct HSpine {
 #[derive(Serialize, Deserialize, Debug)]
 struct HEquation{
     lhs : HSpine,
-    rhs : HSpine
+    rhs : HSpine,
+    is_redex : bool
 }
 #[derive(Serialize, Deserialize, Debug)]
 struct HDecl {
@@ -67,7 +68,7 @@ fn to_ir_decl(d: &HDecl) -> IRDecl {
             None => None,
             Some(d) => Some (to_ir_expr(&d))
         },
-        equations : Vec::new()
+        equations : d.equations.iter().map(to_ir_equation).collect()
     }
 }
 
@@ -76,7 +77,7 @@ fn to_ir_equation(e : &HEquation) -> IREquation {
         lhs : to_ir_spine(&e.lhs),
         rhs : to_ir_spine(&e.rhs),
         attribution : Vec::new()   ,
-        is_redex : false
+        is_redex : e.is_redex
     }
 }
 
@@ -101,7 +102,8 @@ fn to_hspine(s : &IRSpine) -> HSpine {
 fn to_hequation(e : &IREquation) -> HEquation {
     HEquation{
         lhs : to_hspine(&e.lhs),
-        rhs : to_hspine(&e.rhs)
+        rhs : to_hspine(&e.rhs),
+        is_redex : e.is_redex
     }
 }
 
@@ -133,71 +135,47 @@ fn main(prover: Prover, sender: Sender<()>, count: usize, terms: Arc<Mutex<Vec<I
 #[no_mangle]
 pub extern "C" fn canonical(
     goal: *const c_char,
-    name: *const c_char,
     timeout: u64,
     count: usize,
 ) -> *mut c_char {
     unsafe {
         // // get the type transmitted by haskell
         let cstr = CStr::from_ptr(goal).to_str().unwrap();
-        // let rstr = unescape(cstr.to_str().unwrap()).unwrap();
         let goal: HDecl =
             serde_json::from_str(cstr).expect("Failed to convert the JSON to a type.\n");
 
-        // get the IRDecl
-        let ir_decl = to_ir_decl(&goal);
+         // get the IRDecl
+         let ir_decl = to_ir_decl(&goal);
 
-        // Magic
-        let (tx, rx) = mpsc::channel();
-
-
-
-        let arc : Arc<Mutex<Vec<IRExpr>>> = Arc::new(Mutex::new(Vec::new()));
-        let arc_clone = arc.clone();
-        let mut owned_linked = Vec::new();
-        let problem = ir_decl.to_problem(&mut owned_linked);
-        let prover = Prover::new(problem.downgrade());
-
-        let worker = thread::spawn(move || {
-            main(prover, tx, count, arc_clone)
-        });
-        let _ = rx.recv_timeout(Duration::from_secs(timeout));
-        RUN.store(false, Ordering::Relaxed);
-        let res: Vec<HExpr> = match worker.join() {
-            Ok((_, _)) => {
-                let v = arc.lock().unwrap();
-                v.deref().iter().map(to_hexpr).collect()
-            }
-            Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.as_str()
-                } else if let Some(s) = e.downcast_ref::<&'static str>() {
-                    *s
-                } else {
-                    "internal panic"
-                };
-                panic!("{}", msg);
-            }
-        };
+          // Magic
+          let (tx, rx) = mpsc::channel();
 
 
-        // send back results to Haskell
-        let json =
-            serde_json::to_string(&res[0]).expect("Failed to convert type to a JSON format.\n");
-        let cstr2 =
-            CString::from_str(&json.as_str()).expect("Failed to convert JSON to a C string.\n");
-        //
-        // let st = CStr::from_ptr(typ).to_string_lossy().to_string();
-        // let mut fichier = OpenOptions::new()
-        //                 .append(true)
-        //                 .create(true)
-        //                 .open("/home/ewen/Stage/M2/temp/debug.txt")
-        //                 .expect("Impossible d'ouvrir");
-        // //
-        // writeln!(fichier, "{cstr}").unwrap();
-        // //
-        // let cstr2 =
-        //      CString::from_str(cstr).expect("Failed to convert JSON to a C string.\n");
+
+          let arc : Arc<Mutex<Vec<IRExpr>>> = Arc::new(Mutex::new(Vec::new()));
+          let arc_clone = arc.clone();
+          let mut owned_linked = Vec::new();
+          let problem = ir_decl.to_problem(&mut owned_linked);
+          let prover = Prover::new(problem.downgrade());
+
+          let worker = thread::spawn(move || {
+              main(prover, tx, count, arc_clone)
+          });
+          let _ = rx.recv_timeout(Duration::from_secs(timeout));
+          RUN.store(false, Ordering::Relaxed);
+          let res: Vec<HExpr> = match worker.join() {
+              Ok((_, _)) => {
+                  let v = arc.lock().unwrap();
+                  v.deref().iter().map(to_hexpr).collect()
+              }
+              Err(_) => {
+                  Vec::new()
+              }
+          };
+         let json =
+             serde_json::to_string(&res).expect("Failed to convert type to a JSON format.\n");
+         let cstr2 =
+             CString::from_str(&json.as_str()).expect("Failed to convert JSON to a C string.\n");
         cstr2.into_raw()
     }
 }
